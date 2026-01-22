@@ -3,6 +3,7 @@
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/IParserBase.h>
+#include <Parsers/Kusto/ParserKQLLet.h>
 #include <Parsers/Kusto/ParserKQLQuery.h>
 #include <Parsers/Kusto/ParserKQLStatement.h>
 #include <Parsers/Kusto/Utilities.h>
@@ -40,10 +41,64 @@ bool ParserKQLWithOutput::parseImpl(Pos & pos, ASTPtr & node, Expected & expecte
 bool ParserKQLWithUnionQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
     // will support union next phase
+    
+    // First, create a shared select query to accumulate let bindings
+    auto main_select = std::make_shared<ASTSelectQuery>();
+    
+    // Process all let statements
+    while (isValidKQLPos(pos))
+    {
+        String token_str(pos->begin, pos->end);
+        if (token_str == "let")
+        {
+            // Parse the let statement - it will add to main_select's WITH clause
+            ASTPtr let_node = main_select;
+            ParserKQLLet let_parser;
+            
+            if (!let_parser.parse(pos, let_node, expected))
+                return false;
+        }
+        else
+        {
+            // Not a let statement, break and parse the main query
+            break;
+        }
+    }
+    
     ASTPtr kql_query;
 
     if (!ParserKQLQuery().parse(pos, kql_query, expected))
         return false;
+    
+    // If we have let bindings, merge them into the main query
+    if (main_select->with())
+    {
+        auto * select_query = kql_query->as<ASTSelectQuery>();
+        if (select_query)
+        {
+            // Transfer the WITH clause to the main query
+            if (select_query->with())
+            {
+                // Merge WITH clauses
+                auto * existing_with = select_query->with()->as<ASTExpressionList>();
+                auto * new_with = main_select->with()->as<ASTExpressionList>();
+                if (existing_with && new_with)
+                {
+                    // Prepend let bindings to existing WITH clause
+                    existing_with->children.insert(
+                        existing_with->children.begin(),
+                        new_with->children.begin(),
+                        new_with->children.end()
+                    );
+                }
+            }
+            else
+            {
+                // Just set the WITH clause
+                select_query->setExpression(ASTSelectQuery::Expression::WITH, main_select->with());
+            }
+        }
+    }
 
     if (kql_query->as<ASTSelectWithUnionQuery>())
     {
